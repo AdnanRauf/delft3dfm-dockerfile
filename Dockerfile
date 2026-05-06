@@ -1,5 +1,5 @@
 # =============================================================================
-# Delft3D FM container — DIMRset_2026.02
+# Delft3D FM container — DIMRset_2026.01
 # =============================================================================
 # Based on Intel's official oneAPI HPC Kit image (oneAPI 2021.6 era):
 #   - Classic compilers: icc, icpc, ifort
