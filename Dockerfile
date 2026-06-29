@@ -20,7 +20,7 @@
 #   - SWAN source-copy trick from veethahavya-CU-cz/delft3dfm_dockerized
 #
 # Build:
-#   podman build -t delft3dfm:2026.02 -f Dockerfile .
+#   podman build -t delft3dfm:2026.01 -f Dockerfile .
 # =============================================================================
 
 
