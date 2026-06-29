@@ -64,7 +64,7 @@ RUN set -ex \
  && rm -rf /var/lib/apt/lists/*
 
 # ---- Modern CMake from Kitware ---------------------------------------------
-# Ubuntu 20.04 ships CMake 3.16; DIMRset_2026.02 needs >= 3.30.
+# Ubuntu 20.04 ships CMake 3.16; DIMRset_2026.01 needs >= 3.30.
 ARG CMAKE_VERSION=3.30.5
 RUN set -ex \
  && curl -fsSL -o /tmp/cmake.tar.gz \
