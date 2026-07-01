@@ -18,9 +18,37 @@
 #   - Eigen 3.4.0, Boost 1.81.0, preCICE 3.3.0, ESMF 8.9.1
 #   - Modern CMake 3.30.5 (Ubuntu 20.04 ships 3.16; we need 3.30+)
 #   - SWAN source-copy trick from veethahavya-CU-cz/delft3dfm_dockerized
+#   - Patches dflowfm_kernel/CMakeLists.txt and dflowfm-cli_exe/CMakeLists.txt:
+#     upstream only applies the Intel openmp_flag (-qopenmp) to these two
+#     targets inside "if(WIN32)" blocks, never in "if(UNIX)" -- so on Linux
+#     dflowfm silently builds WITHOUT OpenMP (confirmed via `dflowfm --version`
+#     reporting "OpenMP : no") regardless of any -fopenmp env vars passed to
+#     build.sh. We patch both CMakeLists.txt to apply openmp_flag on UNIX too,
+#     matching how swan_omp/CMakeLists.txt already does it correctly.
 #
 # Build:
 #   podman build -t delft3dfm:2026.01 -f Dockerfile .
+#
+# Run (hybrid MPI + OpenMP, single machine / single container):
+#   The runtime stage ships the Intel MPI launcher + libs and libiomp5, so the
+#   binaries can run multi-domain (MPI) and/or multi-threaded (OpenMP). Give the
+#   container enough shared memory for the shm fabric:
+#
+#     # MPI on all cores:
+#     podman run --rm --shm-size=4g -v $PWD:/work delft3dfm:2026.01 \
+#         run_parallel.sh model.mdu
+#
+#     # Hybrid: 4 MPI ranks x 2 OpenMP threads each:
+#     podman run --rm --shm-size=4g -v $PWD:/work delft3dfm:2026.01 \
+#         run_parallel.sh -n 4 -t 2 model.mdu
+#
+#     # Pure OpenMP multicore (single process, all cores):
+#     podman run --rm -e OMP_NUM_THREADS=8 -v $PWD:/work delft3dfm:2026.01 \
+#         dflowfm --autostartstop model.mdu
+#
+#     # Coupled model via DIMR, 6 ranks:
+#     podman run --rm --shm-size=4g -v $PWD:/work delft3dfm:2026.01 \
+#         run_parallel.sh -n 6 -d dimr_config.xml
 # =============================================================================
 
 
@@ -403,6 +431,43 @@ RUN set -ex \
     done \
  && echo "SWAN source files copied to mpi/omp target dirs"
 
+# ---- dflowfm Linux OpenMP fix (upstream CMake bug) --------------------------
+# In this tag, src/cmake/compiler_options/intel.cmake correctly sets
+# openmp_flag=-qopenmp for Intel, and most engines (part, waq, swan_omp) apply
+# it unconditionally. But dflowfm_kernel/CMakeLists.txt and
+# dflowfm-cli_exe/CMakeLists.txt only apply ${openmp_flag} to the target
+# inside "if(WIN32) ... endif(WIN32)" blocks -- the "if(UNIX) ... endif(UNIX)"
+# blocks never reference openmp_flag at all. Result: on Linux, dflowfm compiles
+# without -qopenmp, so _OPENMP is never defined and every !$OMP directive in
+# dflowfm's Fortran source is treated as a plain comment (confirmed via
+# `dflowfm --version` reporting "OpenMP : no" despite -fopenmp being exported
+# as CFLAGS/FCFLAGS -- those env vars are irrelevant here since Delft3D's own
+# CMake ignores ambient *FLAGS for this target and only honours openmp_flag).
+#
+# Fix: add target_compile_options(... ${openmp_flag}) inside each UNIX block,
+# matching the pattern already used correctly by swan_omp/CMakeLists.txt.
+# We grep-verify the expected anchor text first so the build fails loudly
+# (rather than silently building an OpenMP-less binary again) if a future
+# Delft3D tag changes these files.
+RUN set -ex \
+ && K=src/engines_gpl/dflowfm/packages/dflowfm_kernel/CMakeLists.txt \
+ && E=src/engines_gpl/dflowfm/packages/dflowfm-cli_exe/CMakeLists.txt \
+ && echo "--- before patch: confirm UNIX blocks lack openmp_flag ---" \
+ && grep -n 'target_compile_definitions(${library_name} PRIVATE "HAVE_METIS;HAVE_MPI;HAVE_PETSC")' "$K" \
+ && grep -n 'set_target_properties(${executable_name} PROPERTIES OUTPUT_NAME dflowfm)' "$E" \
+ && sed -i \
+      's|target_compile_definitions(${library_name} PRIVATE "HAVE_METIS;HAVE_MPI;HAVE_PETSC")|target_compile_definitions(${library_name} PRIVATE "HAVE_METIS;HAVE_MPI;HAVE_PETSC")\n    target_compile_options(${library_name} PRIVATE ${openmp_flag})|' \
+      "$K" \
+ && sed -i \
+      's|set_target_properties(${executable_name} PROPERTIES OUTPUT_NAME dflowfm)|set_target_properties(${executable_name} PROPERTIES OUTPUT_NAME dflowfm)\n    target_compile_options(${executable_name} PRIVATE ${openmp_flag})\n    target_link_options(${executable_name} PRIVATE ${openmp_flag})|' \
+      "$E" \
+ && echo "--- after patch: openmp_flag now referenced in UNIX blocks ---" \
+ && sed -n '/if (UNIX)/,/endif(UNIX)/p' "$K" \
+ && sed -n '/if(UNIX)/,/endif(UNIX)/p' "$E" \
+ && grep -q 'target_compile_options(${library_name} PRIVATE ${openmp_flag})' "$K" \
+ && grep -q 'target_compile_options(${executable_name} PRIVATE ${openmp_flag})' "$E" \
+ && echo "dflowfm OpenMP Linux patch applied successfully"
+
 
 # ---- The actual Delft3D build ----------------------------------------------
 # Note: DIMRset_2026.01's build.sh has a simpler CLI than 2026.02:
@@ -489,6 +554,114 @@ RUN bash -c 'set -ex \
 # Stage the install tree under a stable name for the runtime stage to copy
 RUN cp -a "${D3D_SRC}/build_${D3D_CONFIG}/install" /opt/delft3dfm-install
 
+# ---- Stage the Intel MPI runtime + launcher for the slim runtime image ------
+# The intel/oneapi-runtime base image ships the compiler/MKL/OpenMP runtimes
+# but NOT the MPI library (libmpi.so.12, libmpifort) and NOT the launcher
+# (mpirun / mpiexec.hydra / hydra_*). dflowfm is linked against Intel MPI, so
+# without these it fails to start. We resolve the versioned oneAPI MPI dir here
+# and copy it to a stable path (/opt/intel-mpi) that stage 4 can COPY verbatim.
+#
+# We also stage libiomp5.so (Intel's OpenMP runtime that icc/ifort-compiled
+# code links against — distinct from GNU libgomp1) so multicore/OpenMP works.
+RUN set -ex \
+ && MPI_DIR="$(ls -d /opt/intel/oneapi/mpi/2021.* 2>/dev/null | sort -V | tail -1)" \
+ && if [ -z "$MPI_DIR" ]; then MPI_DIR="$(ls -d /opt/intel/oneapi/mpi/* 2>/dev/null | grep -v latest | sort -V | tail -1)"; fi \
+ && echo "Staging Intel MPI from: $MPI_DIR" \
+ && test -n "$MPI_DIR" && test -x "$MPI_DIR/bin/mpirun" \
+ && cp -aL "$MPI_DIR" /opt/intel-mpi \
+ && echo "--- launcher + libs present? ---" \
+ && ls -la /opt/intel-mpi/bin/mpirun /opt/intel-mpi/bin/mpiexec.hydra \
+ && ls -la /opt/intel-mpi/lib/release/libmpi.so.12* \
+ && mkdir -p /opt/intel-omp \
+ && IOMP="$(find /opt/intel/oneapi/compiler -name 'libiomp5.so' 2>/dev/null | head -1)" \
+ && test -n "$IOMP" && cp -aL "$IOMP" /opt/intel-omp/ \
+ && echo "Staged libiomp5 from: $IOMP"
+
+# ---- Hybrid MPI+OpenMP launcher helper -------------------------------------
+# Single script that hides the two-step partition-then-mpirun dance and sets
+# safe single-node container defaults. Usage:
+#   run_parallel.sh <model.mdu>            # auto: all cores, MPI only
+#   run_parallel.sh -n 8 <model.mdu>       # 8 MPI ranks
+#   run_parallel.sh -n 4 -t 2 <model.mdu>  # 4 ranks x 2 OpenMP threads (hybrid)
+#   run_parallel.sh -d dimr_config.xml     # DIMR-driven coupled run
+RUN cat > /usr/local/bin/run_parallel.sh <<'EOS' && chmod +x /usr/local/bin/run_parallel.sh
+#!/usr/bin/env bash
+# Delft3D FM hybrid MPI + OpenMP launcher (single-node / single-container).
+set -euo pipefail
+
+NRANKS=""            # MPI ranks (domains). Default: all cores.
+NTHREADS="1"         # OpenMP threads per rank. Default: 1 (pure MPI).
+DIMR_CFG=""          # if set, run DIMR instead of bare dflowfm
+MDU=""
+
+usage() {
+  cat >&2 <<USAGE
+Usage:
+  run_parallel.sh [-n RANKS] [-t THREADS] <model.mdu>
+  run_parallel.sh [-n RANKS] [-t THREADS] -d <dimr_config.xml>
+
+  -n RANKS    number of MPI domains/ranks   (default: all available cores)
+  -t THREADS  OpenMP threads per MPI rank   (default: 1)
+  -d FILE     run via DIMR with this config (coupled models)
+
+Examples:
+  run_parallel.sh model.mdu                 # MPI on all cores
+  run_parallel.sh -n 8 model.mdu            # 8 domains
+  run_parallel.sh -n 4 -t 2 model.mdu       # hybrid: 4 ranks x 2 threads
+  run_parallel.sh -n 6 -d dimr_config.xml   # coupled run, 6 ranks
+USAGE
+  exit 2
+}
+
+while getopts ":n:t:d:h" opt; do
+  case "$opt" in
+    n) NRANKS="$OPTARG" ;;
+    t) NTHREADS="$OPTARG" ;;
+    d) DIMR_CFG="$OPTARG" ;;
+    h) usage ;;
+    *) usage ;;
+  esac
+done
+shift $((OPTIND - 1))
+MDU="${1:-}"
+
+# Total logical cores available to this container.
+NCORES="$(nproc)"
+if [ -z "$NRANKS" ]; then
+  NRANKS=$(( NCORES / NTHREADS ))
+  [ "$NRANKS" -lt 1 ] && NRANKS=1
+fi
+
+export OMP_NUM_THREADS="$NTHREADS"
+# Single-node container: force shared-memory fabric so Intel MPI doesn't hang
+# probing for absent high-speed interconnects.
+export I_MPI_FABRICS="${I_MPI_FABRICS:-shm}"
+export FI_PROVIDER="${FI_PROVIDER:-tcp}"
+# Pin each rank to an OMP-sized domain so hybrid threads land on distinct cores.
+export I_MPI_PIN_DOMAIN="${I_MPI_PIN_DOMAIN:-omp}"
+
+echo "==> cores=$NCORES  ranks=$NRANKS  threads/rank=$NTHREADS  (fabric=$I_MPI_FABRICS)"
+
+if [ -n "$DIMR_CFG" ]; then
+  [ -f "$DIMR_CFG" ] || { echo "DIMR config not found: $DIMR_CFG" >&2; exit 1; }
+  echo "==> mpirun -np $NRANKS dimr $DIMR_CFG"
+  exec mpirun -np "$NRANKS" dimr "$DIMR_CFG"
+fi
+
+[ -n "$MDU" ] || usage
+[ -f "$MDU" ] || { echo "MDU not found: $MDU" >&2; exit 1; }
+
+if [ "$NRANKS" -gt 1 ]; then
+  echo "==> partitioning into $NRANKS domains"
+  dflowfm --partition:ndomains="$NRANKS" "$MDU"
+  echo "==> mpirun -np $NRANKS dflowfm --autostartstop $MDU"
+  exec mpirun -np "$NRANKS" dflowfm --autostartstop "$MDU"
+else
+  echo "==> single rank, OpenMP threads=$NTHREADS"
+  exec dflowfm --autostartstop "$MDU"
+fi
+EOS
+
 
 # =============================================================================
 # Stage 4: runtime — slim image with just runtime libs and Delft3D binaries
@@ -498,6 +671,8 @@ FROM docker.io/intel/oneapi-runtime:latest AS runtime
 ARG DEBIAN_FRONTEND=noninteractive
 
 # Remove problematic Intel repos and install runtime libraries (no -dev packages)
+# hwloc + libfabric are needed by the Intel MPI Hydra launcher for topology
+# detection and the shared-memory/tcp fabric providers.
 RUN set -ex \
  && rm -f /etc/apt/sources.list.d/oneAPI.list \
           /etc/apt/sources.list.d/intel-graphics.list \
@@ -512,11 +687,26 @@ RUN set -ex \
         python3 \
         ca-certificates \
         procps \
+        libhwloc15 \
  && rm -rf /var/lib/apt/lists/*
 
 # Copy our pre-built deps and Delft3D install tree from the build stage
 COPY --from=build /opt/d3d_deps          /opt/d3d_deps
 COPY --from=build /opt/delft3dfm-install /opt/delft3dfm
+
+# ---- Intel MPI runtime + launcher (the key enabler for MPI) -----------------
+# The oneapi-runtime base has no MPI. Bring in the full Intel MPI tree we staged
+# in the build stage: this provides mpirun / mpiexec.hydra / hydra_* launchers,
+# libmpi.so.12, libmpifort, and the libfabric providers dflowfm needs at runtime.
+COPY --from=build /opt/intel-mpi /opt/intel/oneapi/mpi/latest
+
+# ---- Intel OpenMP runtime (the key enabler for multicore) -------------------
+# icc/ifort-compiled binaries link libiomp5.so, not GNU libgomp. Install it to a
+# standard multiarch lib dir so the dynamic loader finds it.
+COPY --from=build /opt/intel-omp/libiomp5.so /usr/lib/x86_64-linux-gnu/libiomp5.so
+
+# Bring in the launcher helper script.
+COPY --from=build /usr/local/bin/run_parallel.sh /usr/local/bin/run_parallel.sh
 
 # Remove system-critical libraries from the Delft3D install tree to avoid
 # overriding the host (Ubuntu 24.04) glibc and other essential libs.
@@ -534,8 +724,58 @@ ENV D3D_DEPS=/opt/d3d_deps \
     PETSC_DIR=/opt/d3d_deps/petsc \
     ESMFMKFILE=/opt/d3d_deps/esmf/lib/esmf.mk
 
-ENV PATH=${D3D_HOME}/bin:${D3D_HOME}/lnx64/bin:${D3D_DEPS}/bin:${D3D_DEPS}/esmf/bin:${PATH} \
-    LD_LIBRARY_PATH=${D3D_HOME}/lib:${D3D_HOME}/lnx64/lib:${D3D_DEPS}/lib:${D3D_DEPS}/lib64:${PETSC_DIR}/lib:${D3D_DEPS}/esmf/lib:${LD_LIBRARY_PATH}
+# ---- Intel MPI runtime environment ------------------------------------------
+# Point at the MPI tree we copied in. Adding bin/ to PATH gives mpirun; adding
+# lib/release + libfabric/lib to LD_LIBRARY_PATH resolves libmpi/libmpifort and
+# the fabric providers.
+ENV I_MPI_ROOT=/opt/intel/oneapi/mpi/latest \
+    FI_PROVIDER_PATH=/opt/intel/oneapi/mpi/latest/libfabric/lib/prov
+
+# ---- Single-node container defaults for hybrid MPI + OpenMP -----------------
+# I_MPI_FABRICS=shm  : use shared memory only (no interconnect probing -> no hangs)
+# FI_PROVIDER=tcp    : safe libfabric provider inside a container
+# I_MPI_PIN_DOMAIN=omp: size each rank's pin domain to OMP_NUM_THREADS so hybrid
+#                      threads land on distinct cores.
+# OMP_NUM_THREADS unset here on purpose -> OpenMP-only runs use all cores by
+# default; the launcher script sets it explicitly for hybrid runs.
+ENV I_MPI_FABRICS=shm \
+    FI_PROVIDER=tcp \
+    I_MPI_PIN_DOMAIN=omp \
+    OMP_PLACES=cores \
+    OMP_PROC_BIND=close
+
+ENV PATH=${D3D_HOME}/bin:${D3D_HOME}/lnx64/bin:${D3D_DEPS}/bin:${D3D_DEPS}/esmf/bin:${I_MPI_ROOT}/bin:${PATH} \
+    LD_LIBRARY_PATH=${D3D_HOME}/lib:${D3D_HOME}/lnx64/lib:${D3D_DEPS}/lib:${D3D_DEPS}/lib64:${PETSC_DIR}/lib:${D3D_DEPS}/esmf/lib:${I_MPI_ROOT}/lib/release:${I_MPI_ROOT}/lib:${I_MPI_ROOT}/libfabric/lib:${LD_LIBRARY_PATH}
+
+# ---- Build-time smoke test: prove MPI + OpenMP runtime is complete ----------
+# Fails the build early (rather than at first user run) if libmpi/libiomp are
+# unresolved, the launcher is missing, or dflowfm was built without OpenMP
+# (see the dflowfm Linux OpenMP CMake patch applied in stage 3 -- this check
+# guards against that regression reappearing in a future Delft3D tag).
+RUN set -ex \
+ && echo "--- launcher present ---" \
+ && which mpirun && mpirun --version | head -1 \
+ && echo "--- dflowfm dynamic deps (must show libmpi + libiomp5, no 'not found') ---" \
+ && DFLOWFM="$(command -v dflowfm || find /opt/delft3dfm -name dflowfm -type f | head -1)" \
+ && ldd "$DFLOWFM" | grep -E 'libmpi|libiomp5|libpetsc' || true \
+ && if ldd "$DFLOWFM" | grep -q 'not found'; then \
+        echo "FATAL: unresolved shared libraries in dflowfm:" ; \
+        ldd "$DFLOWFM" | grep 'not found' ; exit 1 ; \
+    fi \
+ && echo "--- mpirun launches ranks under shm fabric ---" \
+ && I_MPI_FABRICS=shm mpirun -np 2 hostname \
+ && echo "--- dflowfm reports OpenMP: yes (compile-time flag actually applied) ---" \
+ && "$DFLOWFM" --version | tee /tmp/dflowfm_version.txt \
+ && if ! grep -qiE '^OpenMP\s*:\s*yes' /tmp/dflowfm_version.txt; then \
+        echo "FATAL: dflowfm was built WITHOUT OpenMP support -- multicore is broken." ; \
+        cat /tmp/dflowfm_version.txt ; exit 1 ; \
+    fi \
+ && if ! grep -qiE '^MPI\s*:\s*yes' /tmp/dflowfm_version.txt; then \
+        echo "FATAL: dflowfm was built WITHOUT MPI support." ; \
+        cat /tmp/dflowfm_version.txt ; exit 1 ; \
+    fi \
+ && echo "MPI + OpenMP runtime OK (both confirmed yes in dflowfm --version)"
 
 WORKDIR /work
+# Default to an interactive shell; use run_parallel.sh to launch parallel runs.
 CMD ["/bin/bash", "-l"]
