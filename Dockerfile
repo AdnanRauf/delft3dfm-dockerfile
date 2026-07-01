@@ -27,7 +27,7 @@
 #     matching how swan_omp/CMakeLists.txt already does it correctly.
 #
 # Build:
-#   podman build -t delft3dfm:2026.01 -f Dockerfile .
+#   docker build -t delft3dfm:2026.01 -f Dockerfile .
 #
 # Run (hybrid MPI + OpenMP, single machine / single container):
 #   The runtime stage ships the Intel MPI launcher + libs and libiomp5, so the
