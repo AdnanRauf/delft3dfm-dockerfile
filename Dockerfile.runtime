@@ -1,0 +1,214 @@
+# syntax=docker/dockerfile:1
+# =============================================================================
+# Delft3D FM runtime extension — layered on the OFFICIAL delft3d image
+# (built from doc/delft3d.Dockerfile at tag DIMRset_2.31.13).
+#
+# The official final stage is bare AlmaLinux 8 + /delft3d. The install step
+# (src/cmake/install_linux_libs/copy_libs.sh) bundles every shared-library
+# dependency of every executable into /delft3d/lib and patches RPATHs to
+# $ORIGIN:$ORIGIN/../lib — so the binaries are self-contained — but the
+# Intel MPI *launcher* (mpirun / mpiexec.hydra / hydra_* helpers) is not a
+# shared-library dependency and therefore is NOT in the image. Multi-rank
+# runs are impossible without it. This layer adds:
+#
+#   1. The Intel MPI runtime (launcher + libfabric), version-matched to the
+#      MPI the binaries were built against (2021.13.1 for oneAPI 2024).
+#   2. run_parallel.sh — the hybrid MPI+OpenMP launcher helper. Recreated
+#      here with a build-time non-empty gate, permanently fixing the
+#      0-byte-file defect from the earlier bug report.
+#   3. Single-node container env defaults (shm fabric, tcp libfabric
+#      provider, OpenMP pinning).
+#   4. Hard build-time smoke tests, including proof that
+#      ESMF_RegridWeightGen is the mpiuni (MPI-free) build — the structural
+#      fix for the PMPI_Alltoallw segfault/hang in FM+D-Waves coupled runs.
+# =============================================================================
+
+ARG BASE_IMAGE=localhost/delft3d:DIMRset_2.31.13-oneapi-2024-ifx-Release
+FROM ${BASE_IMAGE}
+
+ARG INTEL_MPI_RUNTIME_VERSION=2021.13.1
+
+# ---- Intel MPI runtime + basic ops tools ------------------------------------
+# Runtime-only MPI package (not -devel): provides mpirun, mpiexec.hydra, the
+# hydra_* bootstrap/proxy helpers, libmpi and the bundled libfabric providers.
+# hostname/procps are needed by the launcher and for diagnostics (top, ps).
+RUN <<"EOF"
+set -euxo pipefail
+cat > /etc/yum.repos.d/oneAPI.repo <<'REPO'
+[oneAPI]
+name=Intel oneAPI repository
+baseurl=https://yum.repos.intel.com/oneapi
+enabled=1
+gpgcheck=1
+repo_gpgcheck=1
+gpgkey=https://yum.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB
+REPO
+dnf install --assumeyes \
+    intel-oneapi-mpi-${INTEL_MPI_RUNTIME_VERSION} \
+    hostname procps-ng which
+dnf clean all
+# Resolve the versioned MPI dir to a stable path we can bake into ENV.
+MPI_DIR="$(ls -d /opt/intel/oneapi/mpi/2021.* | sort -V | tail -1)"
+test -x "${MPI_DIR}/bin/mpirun"
+ln -sfn "${MPI_DIR}" /opt/intel/oneapi/mpi/stable
+EOF
+
+# ---- Environment -------------------------------------------------------------
+# /delft3d binaries resolve their own libs via RPATH; LD_LIBRARY_PATH here is
+# for the MPI launcher stack only. Both historical Intel MPI lib layouts are
+# listed (lib/release vs lib, libfabric/lib vs opt/mpi/libfabric/lib) —
+# nonexistent entries are harmless and the smoke test below validates the
+# launcher actually works.
+ENV I_MPI_ROOT=/opt/intel/oneapi/mpi/stable
+ENV D3D_HOME=/delft3d \
+    PATH=/delft3d/bin:${I_MPI_ROOT}/bin:${PATH} \
+    LD_LIBRARY_PATH=${I_MPI_ROOT}/lib:${I_MPI_ROOT}/lib/release:${I_MPI_ROOT}/libfabric/lib:${I_MPI_ROOT}/opt/mpi/libfabric/lib \
+    FI_PROVIDER_PATH=${I_MPI_ROOT}/libfabric/lib/prov:${I_MPI_ROOT}/opt/mpi/libfabric/lib/prov
+
+# Single-node / single-container defaults for hybrid MPI + OpenMP:
+#   I_MPI_FABRICS=shm    shared memory only — no interconnect probing hangs
+#   FI_PROVIDER=tcp      safe libfabric provider inside a container
+#   I_MPI_PIN_DOMAIN=omp pin domains sized to OMP_NUM_THREADS for hybrid runs
+# OMP_NUM_THREADS is deliberately unset: pure-OpenMP runs use all cores;
+# run_parallel.sh sets it explicitly for hybrid runs.
+ENV I_MPI_FABRICS=shm \
+    FI_PROVIDER=tcp \
+    I_MPI_PIN_DOMAIN=omp \
+    OMP_PLACES=cores \
+    OMP_PROC_BIND=close
+
+# ---- run_parallel.sh -----------------------------------------------------------
+RUN cat > /usr/local/bin/run_parallel.sh <<'EOS' && chmod +x /usr/local/bin/run_parallel.sh
+#!/usr/bin/env bash
+# Delft3D FM hybrid MPI + OpenMP launcher (single-node / single-container).
+#
+# Usage:
+#   run_parallel.sh [-n RANKS] [-t THREADS] <model.mdu>
+#   run_parallel.sh [-n RANKS] [-t THREADS] -d <dimr_config.xml>
+#
+#   -n RANKS    MPI domains/ranks              (default: all available cores)
+#   -t THREADS  OpenMP threads per MPI rank    (default: 1 = pure MPI)
+#   -d FILE     run via DIMR with this config  (coupled models, e.g. FM+Waves)
+#
+# Examples:
+#   run_parallel.sh model.mdu                 # MPI on all cores
+#   run_parallel.sh -n 8 model.mdu            # 8 domains
+#   run_parallel.sh -n 4 -t 2 model.mdu       # hybrid: 4 ranks x 2 threads
+#   run_parallel.sh -n 6 -d dimr_config.xml   # coupled run, 6 ranks
+set -euo pipefail
+
+NRANKS=""
+NTHREADS="1"
+DIMR_CFG=""
+
+usage() { grep '^#' "$0" | sed -n '2,16p' >&2; exit 2; }
+
+while getopts ":n:t:d:h" opt; do
+  case "$opt" in
+    n) NRANKS="$OPTARG" ;;
+    t) NTHREADS="$OPTARG" ;;
+    d) DIMR_CFG="$OPTARG" ;;
+    h|*) usage ;;
+  esac
+done
+shift $((OPTIND - 1))
+MDU="${1:-}"
+
+ulimit -s unlimited 2>/dev/null || true
+
+NCORES="$(nproc)"
+if [ -z "$NRANKS" ]; then
+  NRANKS=$(( NCORES / NTHREADS ))
+  [ "$NRANKS" -lt 1 ] && NRANKS=1
+fi
+
+export OMP_NUM_THREADS="$NTHREADS"
+export I_MPI_FABRICS="${I_MPI_FABRICS:-shm}"
+export FI_PROVIDER="${FI_PROVIDER:-tcp}"
+export I_MPI_PIN_DOMAIN="${I_MPI_PIN_DOMAIN:-omp}"
+
+echo "==> cores=$NCORES  ranks=$NRANKS  threads/rank=$NTHREADS  (fabric=$I_MPI_FABRICS)"
+
+if [ -n "$DIMR_CFG" ]; then
+  [ -f "$DIMR_CFG" ] || { echo "DIMR config not found: $DIMR_CFG" >&2; exit 1; }
+  echo "==> mpirun -np $NRANKS dimr $DIMR_CFG"
+  exec mpirun -np "$NRANKS" dimr "$DIMR_CFG"
+fi
+
+[ -n "$MDU" ] || usage
+[ -f "$MDU" ] || { echo "MDU not found: $MDU" >&2; exit 1; }
+
+if [ "$NRANKS" -gt 1 ]; then
+  echo "==> partitioning into $NRANKS domains"
+  dflowfm --nodisplay --partition:ndomains="$NRANKS":icgsolver=6 "$MDU"
+  echo "==> mpirun -np $NRANKS dflowfm --nodisplay --autostartstop $MDU"
+  exec mpirun -np "$NRANKS" dflowfm --nodisplay --autostartstop "$MDU"
+else
+  echo "==> single rank, OpenMP threads=$NTHREADS"
+  exec dflowfm --nodisplay --autostartstop "$MDU"
+fi
+EOS
+
+# ---- Build-time smoke tests ----------------------------------------------------
+# Fail the image build (not the first user run) if anything critical is broken.
+RUN <<"EOF"
+set -euxo pipefail
+
+echo "--- [gate 1] run_parallel.sh exists, is non-empty, and parses ---"
+test -s /usr/local/bin/run_parallel.sh          # the old image shipped a 0-byte file
+bash -n /usr/local/bin/run_parallel.sh
+head -2 /usr/local/bin/run_parallel.sh
+
+echo "--- [gate 2] MPI launcher present and functional under shm fabric ---"
+which mpirun mpiexec.hydra
+mpirun --version | head -2
+I_MPI_FABRICS=shm mpirun -np 2 hostname
+
+echo "--- [gate 3] core binaries present ---"
+test -x /delft3d/bin/dflowfm
+test -x /delft3d/bin/dimr
+test -x /delft3d/bin/run_dimr.sh
+test -x /delft3d/bin/run_dflowfm.sh
+
+echo "--- [gate 4] dflowfm: no unresolved shared libraries ---"
+ldd /delft3d/bin/dflowfm | grep -E 'libmpi|libiomp5|libpetsc' || true
+if ldd /delft3d/bin/dflowfm | grep -q 'not found'; then
+    echo "FATAL: unresolved shared libraries in dflowfm:"
+    ldd /delft3d/bin/dflowfm | grep 'not found'
+    exit 1
+fi
+
+echo "--- [gate 5] dflowfm built with MPI and OpenMP ---"
+# Guards the historical upstream regression where dflowfm-cli_exe applies
+# ${openmp_flag} only under WIN32. In 2.31.13 dflowfm_kernel applies it
+# unconditionally, but keep this gate so the regression can never silently
+# return. If it trips: patch dflowfm-cli_exe/CMakeLists.txt to apply
+# ${openmp_flag} on UNIX (compile + link) and rebuild.
+/delft3d/bin/dflowfm --nodisplay --version | tee /tmp/v.txt
+grep -qiE 'MPI[[:space:]]*:[[:space:]]*yes'    /tmp/v.txt || { echo "FATAL: dflowfm built WITHOUT MPI";    exit 1; }
+grep -qiE 'OpenMP[[:space:]]*:[[:space:]]*yes' /tmp/v.txt || { echo "FATAL: dflowfm built WITHOUT OpenMP"; exit 1; }
+
+echo "--- [gate 6] ESMF regrid tool: present, resolvable, and MPI-FREE ---"
+# wave_exe.cmake installs both the wrapper script and the ESMF binary into
+# /delft3d/bin. The third-party-libs image builds ESMF with ESMF_COMM=mpiuni;
+# an ESMF_RegridWeightGen linking libmpi would reintroduce the exact
+# PMPI_Alltoallw crash/hang reported against the previous image.
+test -s /delft3d/bin/ESMF_RegridWeightGen_in_Delft3D-WAVE.sh
+test -x /delft3d/bin/ESMF_RegridWeightGen
+if ldd /delft3d/bin/ESMF_RegridWeightGen | grep -q 'not found'; then
+    echo "FATAL: unresolved shared libraries in ESMF_RegridWeightGen:"
+    ldd /delft3d/bin/ESMF_RegridWeightGen | grep 'not found'
+    exit 1
+fi
+if ldd /delft3d/bin/ESMF_RegridWeightGen | grep -q 'libmpi'; then
+    echo "FATAL: ESMF_RegridWeightGen links libmpi — expected the mpiuni (serial) build."
+    ldd /delft3d/bin/ESMF_RegridWeightGen | grep libmpi
+    exit 1
+fi
+/delft3d/bin/ESMF_RegridWeightGen --version 2>&1 | head -3 || true
+
+echo "=== ALL GATES PASSED: MPI launcher + OpenMP + serial ESMF regrid OK ==="
+EOF
+
+WORKDIR /work
+CMD ["/bin/bash", "-l"]
