@@ -35,44 +35,6 @@ the upstream Dockerfiles use BuildKit cache mounts for sources, the build
 tree, and the Conan cache (`/root/.conan2`). `START_AT=<1..4>` resumes at a
 given step.
 
-## Why this should fix the ESMF_RegridWeightGen crash/hang
-
-The previous image built ESMF 8.9.1 with `ESMF_COMM=intelmpi`; every FM +
-D-Waves run then died or hung inside `PMPI_Alltoallw` in the MPI-enabled
-`ESMF_RegridWeightGen`, spawned as a subprocess of an already-MPI-launched
-D-Waves. The official `third-party-libs.Dockerfile` builds ESMF with
-**`ESMF_COMM=mpiuni` — no MPI at all** ("we do not need mpi"), removing that
-code path by construction. The install step also now places both the
-`ESMF_RegridWeightGen` binary and its wrapper script into `/delft3d/bin`,
-where the wrapper expects them, and one consistent Intel MPI 2021.13 is used
-throughout (no bundled-vs-oneAPI mismatch). `Dockerfile.runtime` gate 6
-fails the build if the ESMF binary links `libmpi`, so the old failure mode
-cannot silently return. Gate 1 likewise makes an empty `run_parallel.sh`
-(the second defect in the bug report) a build failure.
-
-## Verification (mirrors the bug report's "How to verify a fix")
-
-```bash
-cd delft3d-src/examples/dflowfm/09_dflowfm_parallel_dwaves
-docker run --rm --shm-size=4g -v "$PWD/..":/work \
-    -w /work/09_dflowfm_parallel_dwaves delft3dfm:2.31.13 ./run_example.sh
-```
-
-Confirm the `TMP_ESMF_RegridWeightGen_*_weights_*.nc` file appears (see
-`esmf_sh.log` on failure) and both components enter timestepping. Then a
-custom coupled model and a plain multi-rank FM run:
-
-```bash
-docker run --rm --shm-size=4g -v $PWD:/work delft3dfm:2.31.13 \
-    run_parallel.sh -n 4 -d dimr_config.xml
-docker run --rm --shm-size=4g -v $PWD:/work delft3dfm:2.31.13 \
-    run_parallel.sh -n 8 model.mdu
-```
-
-Do **not** carry over the old workarounds (`I_MPI_ADJUST_ALLTOALLW`, bundled
-libproj/libstdc++ deletion) — they would mask whether the new stack is clean.
-PROJ/GDAL now come from Conan recipes pinned in `conan.lock`.
-
 ## Newer Intel compilers (experimental)
 
 oneAPI **2024.2 + ifx is the latest supported combination** for this tag.
