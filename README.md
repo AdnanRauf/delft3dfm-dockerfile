@@ -55,18 +55,4 @@ at it, and set `INTEL_MPI_RUNTIME_VERSION=2021.18` for step 4. Expect
 PETSc-related Fortran breakage first. Keep 2024.2 as the production image
 and re-sync when Deltares blesses a newer toolchain in a future tag.
 
-## Troubleshooting
 
-- **`RUN <<EOF` parse errors**: BuildKit is required (`DOCKER_BUILDKIT=1`,
-  set by the driver) or podman >= 4.
-- **MPI launcher gate fails on lib paths**: Intel MPI has shuffled its
-  layout across releases (`lib/release` vs `lib`, `libfabric/lib` vs
-  `opt/mpi/libfabric/lib`). Both variants are on `LD_LIBRARY_PATH` /
-  `FI_PROVIDER_PATH`; if a future MPI version moves again, gate 2 fails at
-  build time — inspect `ls /opt/intel/oneapi/mpi/stable` and adjust.
-- **OpenMP gate (5) fails**: the upstream half-fix applies `${openmp_flag}`
-  unconditionally in `dflowfm_kernel` but still WIN32-only in
-  `dflowfm-cli_exe/CMakeLists.txt`. If the gate trips, patch the cli_exe to
-  apply the flag (compile + link) under UNIX and rebuild step 3.
-- **Disk pressure**: `docker builder prune` reclaims BuildKit cache;
-  removing it forces full third-party rebuilds next time.
