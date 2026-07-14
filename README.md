@@ -1,6 +1,5 @@
 # Delft3D FM container — DIMRset_2.31.13 (official pipeline + ops layer)
 
-Replaces the bespoke Ubuntu 20.04 / oneAPI 2021.6 / classic-compiler image.
 `DIMRset_2.31.13` moved to a Conan 2 + `build.py` build system (the old
 `build.sh` no longer exists), requires CMake >= 3.30, contains a C++23 tool,
 and is officially built on **AlmaLinux 8 with Intel oneAPI 2024.2
