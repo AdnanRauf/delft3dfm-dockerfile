@@ -99,7 +99,7 @@ docker run --rm --shm-size=4g --user $(id -u):$(id -g) \
 
 ---
 
-## Delft3D FM — D-Flow FM
+## Delft3D-FM — D-Flow-FM
 
 ```bash
 # Sequential, helper script
@@ -135,7 +135,7 @@ docker run --rm --shm-size=4g --user $(id -u):$(id -g) \
 
 ---
 
-## Delft3D FM — waves, water quality, tools
+## Delft3D-FM — waves, water quality, tools
 
 ```bash
 # Standalone D-Waves (SWAN)
@@ -181,7 +181,7 @@ docker run --rm --user $(id -u):$(id -g) \
 
 ---
 
-## Delft3D 4 classic
+## Delft3D4 classic
 
 ```bash
 # Basic run, default config_d_hydro.xml
