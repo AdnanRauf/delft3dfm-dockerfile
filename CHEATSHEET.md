@@ -1,7 +1,5 @@
 # `delft3dfm:2026.02` — Docker command cheat sheet
 
-Every command written out in full. No aliases.
-
 Standard flags used throughout:
 `--rm` remove container after run · `--shm-size=4g` shared memory for MPI ·
 `--user $(id -u):$(id -g)` write output as you, not root ·
