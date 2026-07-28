@@ -232,10 +232,21 @@ docker run --rm --shm-size=4g --user $(id -u):$(id -g) \
     -v "$PWD":/work -w /work delft3dfm:2026.02 \
     run_delpar.sh model.inp
 
-# Morphological merging
+# Morphological merging (needs Tcl in the image: mormerge.tcl is a Tcl script
+# with a hardcoded "#! /usr/bin/tclsh" shebang)
 docker run --rm --shm-size=4g --user $(id -u):$(id -g) \
     -v "$PWD":/work -w /work delft3dfm:2026.02 \
     run_mormerge.sh --help
+
+# Real run: <mm-file> names the merge condition set. The case directory must
+# contain exactly two subdirectories, "input" and "merge"
+# (see examples/delft3d4/05_mormerge).
+docker run --rm --shm-size=4g --user $(id -u):$(id -g) \
+    -v "$PWD":/work -w /work delft3dfm:2026.02 \
+    run_mormerge.sh basin.mm
+
+# Check the interpreter is present (run_mormerge.sh fails obscurely without it)
+docker run --rm delft3dfm:2026.02 /usr/bin/tclsh <<< 'puts [info patchlevel]'
 ```
 
 ---

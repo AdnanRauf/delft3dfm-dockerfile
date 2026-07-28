@@ -54,6 +54,16 @@ ARG CONFIGURATION=all
 # Runtime-only MPI package (not -devel): provides mpirun, mpiexec.hydra, the
 # hydra_* bootstrap/proxy helpers, libmpi and the bundled libfabric providers.
 # hostname/procps are needed by the launcher and for diagnostics (top, ps).
+#
+# tcl: mormerge is driven by /delft3d/bin/mormerge.tcl, whose shebang is
+# literally "#! /usr/bin/tclsh" and which re-invokes /usr/bin/tclsh by absolute
+# path for the per-condition worker scripts it generates. The official install
+# step ships the .tcl (install(PROGRAMS ... mormerge.tcl DESTINATION bin)) but
+# not an interpreter, so run_mormerge.sh — documented in CHEATSHEET.md and used
+# by both Delft3D 4 AND FM morphodynamics (see
+# test/deltares_testbench/configs/dimr/dimr_dflowfm_mormerge_lnx64.xml) — could
+# not run at all. mormerge.tcl needs no Tcl extensions (no `package require`),
+# so the base tcl package suffices.
 RUN <<"EOF"
 set -euxo pipefail
 cat > /etc/yum.repos.d/oneAPI.repo <<'REPO'
@@ -67,7 +77,7 @@ gpgkey=https://yum.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.
 REPO
 dnf install --assumeyes \
     intel-oneapi-mpi-${INTEL_MPI_RUNTIME_VERSION} \
-    hostname procps-ng which binutils
+    hostname procps-ng which binutils tcl
 dnf clean all
 # Resolve the versioned MPI dir to a stable path we can bake into ENV.
 MPI_DIR="$(ls -d /opt/intel/oneapi/mpi/2021.* | sort -V | tail -1)"
@@ -327,7 +337,34 @@ case "${CONFIGURATION}" in
     ;;
 esac
 
-echo "=== ALL GATES PASSED: MPI launcher + OpenMP + serial ESMF regrid + PROJ data + suite contents OK ==="
+echo "--- [gate 9] Tcl at the hardcoded path mormerge.tcl requires ---"
+# mormerge.tcl's shebang is literally "#! /usr/bin/tclsh", and it re-invokes
+# /usr/bin/tclsh by ABSOLUTE path when it writes the per-condition worker
+# scripts. A tclsh elsewhere on PATH therefore does NOT satisfy it — test the
+# exact path, not `command -v tclsh`.
+test -x /usr/bin/tclsh || {
+    echo "FATAL: /usr/bin/tclsh missing — mormerge.tcl cannot execute."
+    echo "       Add 'tcl' to the dnf install list above."
+    exit 1; }
+echo 'puts "tcl [info patchlevel] ok"' | /usr/bin/tclsh
+
+# The Tcl driver and its shell launcher are installed by
+# src/tools_gpl/mormerge/packages/mormerge/CMakeLists.txt, which is only part of
+# the build for configurations that include the classic tools.
+case "${CONFIGURATION}" in
+  all|d3d4-suite)
+    test -x /delft3d/bin/mormerge.tcl || {
+        echo "FATAL: /delft3d/bin/mormerge.tcl missing"; exit 1; }
+    test -s /delft3d/bin/run_mormerge.sh || {
+        echo "FATAL: /delft3d/bin/run_mormerge.sh missing"; exit 1; }
+    echo "mormerge driver present; shebang: $(head -1 /delft3d/bin/mormerge.tcl)"
+    ;;
+  *)
+    echo "NOTE: CONFIGURATION=${CONFIGURATION} — skipping mormerge asset checks."
+    ;;
+esac
+
+echo "=== ALL GATES PASSED: MPI launcher + OpenMP + serial ESMF regrid + PROJ data + Tcl/mormerge + suite contents OK ==="
 EOF
 
 WORKDIR /work
